@@ -310,3 +310,24 @@ class KubernetesManager:
         except Exception:
             pass
         return None
+    async def get_hpa_desired(self, name: str, namespace: str = "default") -> int:
+        """Get HPA desired replicas"""
+        try:
+            autoscaling_v2 = client.AutoscalingV2Api()
+            hpa = autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+                name=name, 
+                namespace=namespace
+            )
+            return int(getattr(hpa.status, "desired_replicas", 1))
+        except Exception as e:
+            logger.warning(f"Could not get HPA desired replicas: {e}")
+            return 1
+
+    async def get_node_count(self) -> int:
+        """Get current node count"""
+        try:
+            nodes = self.v1.list_node()
+            return len(nodes.items or [])
+        except Exception as e:
+            logger.warning(f"Could not get node count: {e}")
+            return 1

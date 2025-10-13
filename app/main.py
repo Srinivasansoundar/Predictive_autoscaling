@@ -12,6 +12,9 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 import uvicorn
+from .ppo_agent import PPOScalingAgent
+from .scaling_controller import ScalingController
+from .state_adapter import build_state_vector
 import os
 
 from .models import TrafficPattern, TrafficStatus, DeploymentStatus
@@ -31,9 +34,36 @@ app = FastAPI(
 # Global instances
 k8s_manager = KubernetesManager()
 traffic_generator = LocustTrafficGenerator()
+ppo_agent = PPOScalingAgent(
+    model_path=os.getenv("PPO_MODEL_PATH", "models/ppo_k8s_scaler"),
+    min_replicas=int(os.getenv("MIN_REPLICAS", "1")),
+    max_replicas=int(os.getenv("MAX_REPLICAS", "10"))
+)
+scaling_controller = ScalingController(k8s_manager, ppo_agent)
 
+# Control loop task storage
+control_loop_task = None
 # Background task storage
 background_tasks_status = {}
+
+# Add helper function to extract Locust aggregated stats
+def _extract_aggregated(locust_stats_for_task: dict) -> dict:
+    """Extract aggregated stats from Locust response"""
+    stats_list = (locust_stats_for_task or {}).get("stats", [])
+    agg = next((s for s in stats_list if s.get("name") in ("Aggregated", "")), None)
+    if not agg and stats_list:
+        total_req = sum(s.get("num_requests", 0) for s in stats_list)
+        total_fail = sum(s.get("num_failures", 0) for s in stats_list)
+        rps = sum(float(s.get("current_rps", 0.0)) for s in stats_list)
+        p95 = max((float(s.get("ninety_fifth_response_time", 0.0)) for s in stats_list), default=0.0)
+        agg = {
+            "name": "Aggregated",
+            "num_requests": total_req,
+            "num_failures": total_fail,
+            "current_rps": rps,
+            "ninety_fifth_response_time": p95,
+        }
+    return agg or {}
 
 @app.on_event("startup")
 async def startup_event():
@@ -89,49 +119,103 @@ def _extract_aggregated(locust_stats_for_task: dict) -> dict:
 
 @app.get("/state/vector")
 async def get_state_vector():
-    # 1) Workload: pull latest Locust stats (choose the latest task if multiple)
-    locust_all = traffic_generator.get_current_stats()  # {task_id: {...}}
-    agg = {}
-    if locust_all:
-        # choose the last key by start time if you track it, else arbitrary pick
-        any_task_id = next(iter(locust_all.keys()))
-        agg = _extract_aggregated(locust_all.get(any_task_id, {}))
-
-    # 2) Infra: deployment/pod metrics
-    deploy_status = await k8s_manager.get_deployment_status()  # includes ready_replicas, labels
-    pods = await k8s_manager.get_pod_metrics()  # list of PodMetrics dicts
-
-    # 3) HPA desired + node count (see KubernetesManager additions below)
+    """Get current state vector for PPO"""
     try:
-        hpa_desired = await k8s_manager.get_hpa_desired(name="php-apache", namespace="default")
-    except Exception:
-        hpa_desired = deploy_status.desired_replicas if hasattr(deploy_status, "desired_replicas") else 0
-    try:
-        node_count = await k8s_manager.get_node_count()
-    except Exception:
-        node_count = 0
+        # 1) Workload: Locust stats
+        locust_all = traffic_generator.get_current_stats()
+        agg = {}
+        if locust_all:
+            any_task_id = next(iter(locust_all.keys()))
+            agg = _extract_aggregated(locust_all.get(any_task_id, {}))
 
-    # 4) Scaling context (store these in memory when actions are executed; default to zeros)
-    last_action_delta = 0
-    steps_since_action = 0
+        # 2) Infra: deployment/pod metrics
+        deploy_status = await k8s_manager.get_deployment_status()
+        pods = await k8s_manager.get_pod_metrics()
 
-    # 5) Optional cost hints (stub or wire later)
-    cost_per_min_usd = 0.0
-    spot_ratio = 0.0
+        # 3) HPA desired + node count
+        try:
+            hpa_desired = await k8s_manager.get_hpa_desired(name="php-apache-hpa", namespace="default")
+        except Exception:
+            hpa_desired = getattr(deploy_status, "desired_replicas", 1)
+        
+        try:
+            node_count = await k8s_manager.get_node_count()
+        except Exception:
+            node_count = 1
 
-    # 6) Build the state vector
-    state = build_state_vector(
-        locust_agg=agg,
-        pod_metrics=[pm.dict() if hasattr(pm, "dict") else pm for pm in pods],
-        deploy_status=deploy_status.dict() if hasattr(deploy_status, "dict") else deploy_status,
-        hpa_desired=hpa_desired,
-        node_count=node_count,
-        last_action_delta=last_action_delta,
-        steps_since_action=steps_since_action,
-        cost_per_min_usd=cost_per_min_usd,
-        spot_ratio=spot_ratio
+        # 4) Build state vector
+        state = build_state_vector(
+            locust_agg=agg,
+            pod_metrics=[pm.dict() if hasattr(pm, "dict") else pm.__dict__ for pm in pods],
+            deploy_status=deploy_status.dict() if hasattr(deploy_status, "dict") else deploy_status.__dict__,
+            hpa_desired=hpa_desired,
+            node_count=node_count,
+            last_action_delta=scaling_controller.last_action_delta,
+            steps_since_action=scaling_controller.steps_since_action
+        )
+        
+        return state
+        
+    except Exception as e:
+        logger.error(f"Failed to get state vector: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"State vector generation fail")
+# Add PPO control endpoints
+@app.post("/ppo/start")
+async def start_ppo_control():
+    """Start PPO-based autoscaling control loop"""
+    global control_loop_task
+    
+    if control_loop_task and not control_loop_task.done():
+        return {"status": "already_running", "message": "PPO control loop is already running"}
+    
+    # Start control loop
+    control_loop_task = asyncio.create_task(
+        scaling_controller.control_loop(get_state_vector)
     )
-    return state
+    
+    return {
+        "status": "started",
+        "message": "PPO control loop started",
+        "control_interval": scaling_controller.control_interval
+    }
+
+@app.post("/ppo/stop")
+async def stop_ppo_control():
+    """Stop PPO control loop"""
+    scaling_controller.stop()
+    
+    if control_loop_task:
+        await control_loop_task
+    
+    return {"status": "stopped", "message": "PPO control loop stopped"}
+
+@app.post("/ppo/train")
+async def train_ppo_model(timesteps: int = 10000):
+    """Train PPO model"""
+    try:
+        ppo_agent.enable_training_mode()
+        # Run training in background
+        asyncio.create_task(asyncio.to_thread(ppo_agent.train, timesteps))
+        
+        return {
+            "status": "training_started",
+            "timesteps": timesteps,
+            "message": "PPO training started in background"
+        }
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+
+@app.get("/ppo/status")
+async def get_ppo_status():
+    """Get PPO agent status"""
+    return {
+        "training_mode": ppo_agent.training_mode,
+        "control_loop_running": scaling_controller.is_running,
+        "last_action_delta": scaling_controller.last_action_delta,
+        "steps_since_action": scaling_controller.steps_since_action,
+        "control_interval": scaling_controller.control_interval
+    }
 @app.post("/deploy/php-apache")
 async def deploy_php_apache():
     """Deploy the php-apache sample application"""
