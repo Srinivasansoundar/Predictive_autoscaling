@@ -52,6 +52,11 @@ class KubernetesScalingEnv(gym.Env):
                 low=np.array([-10, 0], dtype=np.float32),
                 high=np.array([10, 100], dtype=np.float32),
                 dtype=np.float32
+            ),
+            'trend': spaces.Box(
+                low=np.array([-100, -100, -100], dtype=np.float32),
+                high=np.array([100, 100, 100], dtype=np.float32),
+                dtype=np.float32
             )
         })
         
@@ -86,6 +91,11 @@ class KubernetesScalingEnv(gym.Env):
             'scaling': np.array([
                 state_dict['scaling']['last_action_delta'],
                 state_dict['scaling']['steps_since_action']
+            ], dtype=np.float32),
+            'trend': np.array([
+                state_dict['trend']['cpu_slope'],
+                state_dict['trend']['rps_slope'],
+                state_dict['trend']['latency_slope']
             ], dtype=np.float32)
         }
     
@@ -95,44 +105,66 @@ class KubernetesScalingEnv(gym.Env):
         return action_map[action]
     
     def _calculate_reward(self, state_dict: Dict[str, Any], action_delta: int) -> float:
-        """Calculate reward based on system metrics"""
+        """Calculate reward based on system metrics and predictive trends"""
         workload = state_dict['workload']
         infra = state_dict['infra']
-        
+        trend = state_dict.get('trend', {'cpu_slope': 0, 'rps_slope': 0, 'latency_slope': 0})
+        cpu_trend = trend.get('cpu_slope', 0)
+        rps_trend = trend.get('rps_slope', 0)
+        latency_trend = trend.get('latency_slope', 0)
+
         # Latency penalty (normalized)
         latency_penalty = (workload['p95_latency_ms'] / self.target_latency_ms) - 1.0
         latency_penalty = max(0, latency_penalty) * 10  # Heavy penalty for exceeding target
-        
+
         # Error penalty
         error_penalty = workload['error_rate_pct'] * 5.0
-        
-        # Resource efficiency reward (prefer lower utilization with good performance)
+
+        # Resource efficiency reward
         cpu_util = infra['cpu_utilization_pct']
         if cpu_util > self.max_cpu_util:
             cpu_penalty = (cpu_util - self.max_cpu_util) / 10.0
         else:
             cpu_penalty = 0
-            
-        # Resource waste penalty (too many idle pods)
+
+        # Resource waste penalty
         if cpu_util < 30 and infra['pods_ready'] > self.min_replicas:
             waste_penalty = (30 - cpu_util) / 20.0
         else:
             waste_penalty = 0
-        
-        # Scaling smoothness penalty (avoid thrashing)
+
+        # Scaling smoothness penalty
         scaling_penalty = abs(action_delta) * 0.5
-        
-        # Combine into total reward (higher is better)
-        reward = - (latency_penalty + error_penalty + cpu_penalty + 
-                   waste_penalty + scaling_penalty)
-        
+
+        # ----- TREND/ANTICIPATORY REWARD LOGIC -----
+        trend_bonus = 0
+        # If cpu or rps rising sharply, reward upscaling
+        if (cpu_trend > 5 or rps_trend > 10) and action_delta > 0:
+            trend_bonus += 2.0
+        # If cpu/rps dropping, reward downscaling
+        if (cpu_trend < -5 or rps_trend < -10) and action_delta < 0:
+            trend_bonus += 2.0
+        # Penalize upscaling during negative trend, and vice versa
+        if (cpu_trend < -5 or rps_trend < -10) and action_delta > 0:
+            trend_bonus -= 2.0
+        if (cpu_trend > 5 or rps_trend > 10) and action_delta < 0:
+            trend_bonus -= 2.0
+        # Penalize unnecessary scaling when trends are flat
+        if abs(action_delta) > 0 and abs(cpu_trend) < 3 and abs(rps_trend) < 5:
+            trend_bonus -= 1.0
+
+        # Combine into total reward
+        reward = - (latency_penalty + error_penalty + cpu_penalty +
+                    waste_penalty + scaling_penalty) + trend_bonus
+
         # Bonus for meeting SLO with efficient resource use
-        if (workload['p95_latency_ms'] < self.target_latency_ms and 
-            workload['error_rate_pct'] < 1.0 and 
+        if (workload['p95_latency_ms'] < self.target_latency_ms and
+            workload['error_rate_pct'] < 1.0 and
             30 <= cpu_util <= self.max_cpu_util):
             reward += 5.0
-            
+
         return float(reward)
+
     
     def set_state(self, state_dict: Dict[str, Any]):
         """External method to update environment state from real system"""
@@ -168,20 +200,21 @@ class KubernetesScalingEnv(gym.Env):
         """Reset environment to initial state"""
         super().reset(seed=seed)
         self.episode_step = 0
-        
-        # Initialize with a default state if none provided
+
         if self.current_state is None:
             self.current_state = {
                 'workload': {'rps': 0, 'p95_latency_ms': 100, 'error_rate_pct': 0, 'queue_length': 0},
                 'infra': {'pods_ready': self.min_replicas, 'hpa_desired_replicas': self.min_replicas,
-                         'cpu_utilization_pct': 50, 'mem_utilization_pct': 50, 'node_count': 1,
-                         'pod_cpu_request_cores': 0.2, 'pod_cpu_limit_cores': 0.5},
+                        'cpu_utilization_pct': 50, 'mem_utilization_pct': 50, 'node_count': 1,
+                        'pod_cpu_request_cores': 0.2, 'pod_cpu_limit_cores': 0.5},
                 'time': {'minute_of_day_sin': 0, 'minute_of_day_cos': 1, 'day_of_week': 0},
-                'scaling': {'last_action_delta': 0, 'steps_since_action': 0}
+                'scaling': {'last_action_delta': 0, 'steps_since_action': 0},
+                'trend': {'cpu_slope': 0.0, 'rps_slope': 0.0, 'latency_slope': 0.0}  # <--- add this
             }
-        
+
         obs = self._state_dict_to_obs(self.current_state)
         return obs, {}
+
 
 
 class PPOScalingAgent:

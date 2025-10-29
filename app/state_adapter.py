@@ -29,6 +29,7 @@ def parse_mem_mebibytes(val: str) -> float:
     elif v.endswith("g"): mult, v = 1024.0, v[:-1]
     return float(v) * mult
 
+
 def build_state_vector(
     locust_agg: dict,
     pod_metrics: list,
@@ -38,7 +39,8 @@ def build_state_vector(
     last_action_delta: int,
     steps_since_action: int,
     cost_per_min_usd: float = 0.0,
-    spot_ratio: float = 0.0
+    spot_ratio: float = 0.0,
+    previous_metrics=None,
 ) -> dict:
     # Workload
     num_req = max(1, int(locust_agg.get("num_requests", 0)))
@@ -84,6 +86,16 @@ def build_state_vector(
     minute_sin, minute_cos = math.sin(theta), math.cos(theta)
     day_of_week = now.weekday()
 
+    # Compute slopes if previous_metrics provided
+    if previous_metrics:
+        cpu_slope = cpu_util_pct - previous_metrics.get('cpu_util_pct', cpu_util_pct)
+        rps_slope = rps - previous_metrics.get('rps', rps)
+        latency_slope = p95 - previous_metrics.get('p95_latency_ms', p95)
+    else:
+        cpu_slope = 0.0
+        rps_slope = 0.0
+        latency_slope = 0.0
+
     return {
         "workload": {
             "rps": rps,
@@ -112,5 +124,11 @@ def build_state_vector(
         "scaling": {
             "last_action_delta": int(last_action_delta),
             "steps_since_action": int(steps_since_action)
+        },
+        "trend": {
+            "cpu_slope": cpu_slope,
+            "rps_slope": rps_slope,
+            "latency_slope": latency_slope
         }
     }
+

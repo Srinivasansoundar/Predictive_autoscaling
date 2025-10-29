@@ -17,7 +17,7 @@ from .scaling_controller import ScalingController
 from .state_adapter import build_state_vector
 import os
 
-from .models import TrafficPattern, TrafficStatus, DeploymentStatus
+from .models import TrafficPattern, TrafficStatus, DeploymentStatus,StartTrafficRequest,TrafficPatternType
 from .traffic_generator import LocustTrafficGenerator
 from .kubernetes_client import KubernetesManager
 from .state_adapter import build_state_vector
@@ -30,6 +30,7 @@ app = FastAPI(
     description="FastAPI service to deploy sample app and generate traffic patterns",
     version="1.0.0"
 )
+
 
 # Global instances
 k8s_manager = KubernetesManager()
@@ -116,7 +117,6 @@ def _extract_aggregated(locust_stats_for_task: dict) -> dict:
             "ninetieth_response_time": p90,
         }
     return agg or {}
-
 @app.get("/state/vector")
 async def get_state_vector():
     """Get current state vector for PPO"""
@@ -143,7 +143,9 @@ async def get_state_vector():
         except Exception:
             node_count = 1
 
-        # 4) Build state vector
+        previous_metrics = getattr(scaling_controller, 'prev_metrics', None)
+
+        # 4) Build state vector passing previous_metrics for slope calc
         state = build_state_vector(
             locust_agg=agg,
             pod_metrics=[pm.dict() if hasattr(pm, "dict") else pm.__dict__ for pm in pods],
@@ -151,14 +153,15 @@ async def get_state_vector():
             hpa_desired=hpa_desired,
             node_count=node_count,
             last_action_delta=scaling_controller.last_action_delta,
-            steps_since_action=scaling_controller.steps_since_action
+            steps_since_action=scaling_controller.steps_since_action,
+            previous_metrics=previous_metrics
         )
-        
         return state
-        
+
     except Exception as e:
         logger.error(f"Failed to get state vector: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"State vector generation fail")
+        raise HTTPException(status_code=500, detail="State vector generation fail")
+
 # Add PPO control endpoints
 @app.post("/ppo/start")
 async def start_ppo_control():
@@ -247,22 +250,45 @@ async def get_deployment_status():
 @app.post("/traffic/start")
 async def start_traffic_generation(
     background_tasks: BackgroundTasks,
-    pattern: TrafficPattern
+    req: StartTrafficRequest
 ):
     """Start traffic generation with specified pattern"""
     try:
-        task_id = f"traffic_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+        # Normalize and validate pattern_type (accept lowercase)
+        pt_str = (req.pattern_type or "").strip().lower()
+        valid = {"burst", "steady", "wave", "step"}
+        if pt_str not in valid:
+            raise HTTPException(
+                status_code=422, 
+                detail=f"Invalid pattern_type '{req.pattern_type}', expected one of {sorted(valid)}"
+            )
+
+        # Map to enum
+        enum_map = {
+            "burst": TrafficPatternType.BURST,
+            "steady": TrafficPatternType.STEADY,
+            "wave": TrafficPatternType.WAVE,
+            "step": TrafficPatternType.STEP,
+        }
+        desired_enum = enum_map[pt_str]
+        
+        # Ensure inner pattern has correct enum value
+        req.pattern.pattern_type = desired_enum
+
+        # Generate task_id
+        task_id = req.task_id or f"traffic_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         
         # Start traffic generation in background
         background_tasks.add_task(
             run_traffic_generation, 
             task_id, 
-            pattern
+            req.pattern
         )
         
         background_tasks_status[task_id] = {
             "status": "starting",
-            "pattern": pattern.dict(),
+            "pattern": req.pattern.dict(),
+            "pattern_type": pt_str,
             "start_time": datetime.utcnow().isoformat(),
             "task_id": task_id
         }
@@ -271,11 +297,15 @@ async def start_traffic_generation(
             "status": "success",
             "message": "Traffic generation started",
             "task_id": task_id,
-            "pattern": pattern.dict()
+            "pattern_type": pt_str,
+            "pattern": req.pattern.dict()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to start traffic generation: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Traffic generation failed: {str(e)}")
+
 
 @app.get("/traffic/status/{task_id}")
 async def get_traffic_status(task_id: str):

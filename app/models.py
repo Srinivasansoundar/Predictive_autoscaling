@@ -3,11 +3,25 @@ from typing import Optional, Dict, Any, List
 from enum import Enum
 from datetime import datetime
 
+
+# keep your existing TrafficPattern/TrafficPatternType definitions
+
+
 class TrafficPatternType(str, Enum):
     BURST = "burst"
     STEADY = "steady"
     WAVE = "wave"
     STEP = "step"
+    
+    @classmethod
+    def _missing_(cls, value):
+        """Enable case-insensitive lookup"""
+        if isinstance(value, str):
+            value = value.lower()
+            for member in cls:
+                if member.value.lower() == value:
+                    return member
+        return None
 
 class TrafficPattern(BaseModel):
     pattern_type: TrafficPatternType
@@ -37,6 +51,10 @@ class TrafficPattern(BaseModel):
     request_timeout: int = 30
     connection_timeout: int = 10
 
+class StartTrafficRequest(BaseModel):
+    task_id: Optional[str] = None
+    pattern_type: str  # accepts lowercase like "burst", "steady", etc.
+    pattern: TrafficPattern
 
 class TrafficStatus(BaseModel):
     task_id: str
